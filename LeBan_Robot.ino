@@ -941,6 +941,11 @@ button:active{background:rgba(0,255,225,.35)}
 <input id="spd" type="range" min="80" max="240" step="10" value="180" style="width:100%;accent-color:#00ffd1" oninput="spdShow()" onchange="saveSpd()">
 <div id="spdval" style="font-size:14px;color:#8a8aa3;margin:2px 0">当前: 180</div>
 </div>
+<h2>时间同步</h2>
+<div class="btns">
+<button class="wide" onclick="syncTime()" style="grid-column:1/4">🕐 同步手机时间到机器人</button>
+</div>
+<div id="robottime" style="font-size:14px;color:#8a8aa3;margin:4px 0">机器人时间: --:--</div>
 <div id="status">就绪 · 连本热点时请关闭手机移动数据</div>
 <script>
 function go(c,name){
@@ -962,10 +967,25 @@ function saveSpd(){
   fetch('/spd?val='+v,{cache:'no-store'}).then(function(r){return r.text();})
   .then(function(t){document.getElementById('spdval').textContent='✓ 已保存 转速: '+t;});
 }
+function syncTime(){
+  var d=new Date();
+  var h=d.getHours();
+  var m=d.getMinutes();
+  var st=document.getElementById('status');
+  st.className=''; st.textContent='同步时间中...';
+  fetch('/settime?h='+h+'&m='+m,{cache:'no-store'}).then(function(r){return r.text();})
+  .then(function(t){
+    st.className='ok'; st.textContent='✓ 已同步: '+t;
+    document.getElementById('robottime').textContent='机器人时间: '+t;
+  }).catch(function(){
+    st.className='err'; st.textContent='✗ 同步失败, 关掉手机移动数据再试';
+  });
+}
 var spdInit=false;
 function poll(){
   fetch('/wifistat',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){
     if(!spdInit && j.spd){spdInit=true;document.getElementById('spd').value=j.spd;spdShow();}
+    if(j.time){document.getElementById('robottime').textContent='机器人时间: '+j.time;}
   }).catch(function(){});
 }
 setInterval(poll,2500); poll();
@@ -975,8 +995,10 @@ setInterval(poll,2500); poll();
 
 WebServer server(80);
 
-void onWifiStat() {                  // 网页滑块同步当前转速用
-  String j = "{\"spd\":" + String(maxSpeed) + "}";
+void onWifiStat() {                  // 网页滑块同步当前转速/时间用
+  char t[6];
+  snprintf(t, sizeof(t), "%02d:%02d", sysHour, sysMinute);
+  String j = "{\"spd\":" + String(maxSpeed) + ",\"time\":\"" + String(t) + "\"}";
   server.send(200, "application/json", j);
 }
 
@@ -1006,6 +1028,16 @@ void setupServer() {
     prefs.end();
     Serial.printf("[转速] maxSpeed=%d\n", maxSpeed);
     server.send(200, "text/plain", String(v));
+  });
+  server.on("/settime", []() {            // 网页同步手机时间到机器人软时钟
+    int h = constrain(server.arg("h").toInt(), 0, 23);
+    int m = constrain(server.arg("m").toInt(), 0, 59);
+    sysHour = h; sysMinute = m;
+    lastMinuteTick = millis();            // 重置软时钟计时基准
+    char t[6];
+    snprintf(t, sizeof(t), "%02d:%02d", h, m);
+    Serial.printf("[网页校时] %s\n", t);
+    server.send(200, "text/plain", String(t));
   });
 }
 
