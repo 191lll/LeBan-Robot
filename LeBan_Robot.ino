@@ -57,7 +57,8 @@ int maxSpeed = 180;       // 网页调试行驶力度(网页滑块可调, 存NVS
 // ---------------- 演示开关 ----------------
 // demoEnabled=true 上电自动演示(答辩用, 时间压缩); 网页可随时暂停/开启
 // false=按真实时钟9/15/21点触发
-bool demoEnabled = true;
+bool demoEnabled = false;
+bool webHold = false;                   // 网页/串口手动触发时=按住当前状态不放, 直到下一条命令
 #define DEMO_BOOT_MS  3000   // 开机后多久开始演示
 #define DEMO_GAP_MS   25000  // 每轮提醒间隔: 笑脸10秒+大时钟15秒(40分钟的演示压缩)
 // 遗忘重试: 真实1/3/5分钟; 演示6/10/15秒
@@ -240,22 +241,28 @@ void drawEyes(int mood, int dx, int dy, bool blink) {
   showOLED();
 }
 
-// 开机字标 LeBan (3x5点阵, 3倍放大)
+// 开机字标 LeBan (标准5x7字库, 4倍放大, 居中占满)
 void drawLogo() {
   clearBuf();
-  static const uint8_t FONT[5][5] = {   // L e B a n
-    {0b100,0b100,0b100,0b100,0b111},
-    {0b111,0b100,0b111,0b001,0b111},
-    {0b110,0b101,0b110,0b101,0b110},
-    {0b111,0b001,0b111,0b101,0b111},
-    {0b110,0b101,0b101,0b101,0b101},
+  // Adafruit glcdfont 经典5x7标准字库 (列扫描, bit0=顶行); 小写按x高度排版
+  static const uint8_t FONT[5][5] = {
+    {0x7F,0x40,0x40,0x40,0x40},  // L
+    {0x38,0x54,0x54,0x54,0x18},  // e  上弧+中横, 下方右侧开口
+    {0x7F,0x49,0x49,0x49,0x36},  // B
+    {0x20,0x54,0x54,0x54,0x78},  // a  封闭碗形+右竖
+    {0x7C,0x04,0x04,0x04,0x78},  // n
   };
-  const int s = 3, adv = 12, x0 = 35, y0 = 24;
+  const int s = 4;                 // 4倍放大: 每字20x28
+  const int gw = 5 * s;            // 字宽20
+  const int gh = 7 * s;            // 字高28
+  const int adv = 23;              // 字间距3像素
+  const int x0 = (128 - (4 * adv + gw)) / 2;   // 整串水平居中
+  const int y0 = (64 - gh) / 2;                 // 垂直居中
   for (int c = 0; c < 5; c++)
-    for (int r = 0; r < 5; r++)
-      for (int b = 0; b < 3; b++)
-        if (FONT[c][r] & (0b100 >> b))
-          fillRect(x0 + c * adv + b * s, y0 + r * s, s, s, 1);
+    for (int col = 0; col < 5; col++)
+      for (int row = 0; row < 7; row++)
+        if (FONT[c][col] & (1 << row))
+          fillRect(x0 + c * adv + col * s, y0 + row * s, s, s, 1);
   showOLED();
 }
 
@@ -433,19 +440,19 @@ void rockRamp(unsigned long now) {
     if (rockWantDir == DIR_NONE && rockWantPwm == 0) return;  // 无任务: 不碰电机
     rockActive = true;                                         // 有新目标: 接管
   }
-  if (now - rockRampLast < 8) return;          // 约125Hz刷新
+  if (now - rockRampLast < 12) return;         // 约83Hz刷新, 拉长斜坡周期
   rockRampLast = now;
   if (rockCurDir != rockWantDir) {             // 需要换向/启动/停止: 先降到0
     if (rockCurPwm > 0) {
-      rockCurPwm -= 40;
+      rockCurPwm -= 30;
       if (rockCurPwm < 0) rockCurPwm = 0;
       applyMotor(rockCurDir, rockCurPwm);
       return;
     }
     rockCurDir = rockWantDir;
   }
-  if (rockCurPwm < rockWantPwm) {              // 软加速: 每步+10
-    rockCurPwm += 10;
+  if (rockCurPwm < rockWantPwm) {              // 软加速: 每步+6, 0->70约140ms
+    rockCurPwm += 6;
     if (rockCurPwm > rockWantPwm) rockCurPwm = rockWantPwm;
   } else if (rockCurPwm > rockWantPwm) {
     rockCurPwm -= 40;
@@ -461,11 +468,12 @@ void rockStop() {
   rockWantDir = DIR_NONE; rockWantPwm = 0;      // 斜坡软停, 不突然断电
   rockCurDir = DIR_NONE;  rockCurPwm = 0;       // 重置斜坡当前状态, 防止rockRamp重新出力
   rockActive = false;
+  applyMotor(DIR_NONE, 0);                      // 立即切断电机PWM, 防止残留出力
 }
 void rockTick(unsigned long now, int level) {
-  // 三档力度: 首次轻 / 重试中 / 最强 (单节电池下降低峰值防掉压)
-  int spdF = (level >= 3) ? 160 : (level == 2 ? 140 : 100);
-  int spdB = (level >= 3) ? 120 : (level == 2 ? 105 : 80);
+  // 三档力度: 首次轻 / 重试中 / 最强 (单节电池下压低峰值防欠压重启, 2026-09调降)
+  int spdF = (level >= 3) ? 120 : (level == 2 ? 100 : 70);
+  int spdB = (level >= 3) ? 90  : (level == 2 ? 75  : 50);
   unsigned long durs[4] = { 500, 200, 500, 200 };
   if (now - rockStart >= durs[rockPhase]) {
     rockStart = now;
@@ -613,6 +621,7 @@ void idleEnterClock(unsigned long now) {   // 切到整屏大时钟
 }
 void idleCycleTick(unsigned long now) {
   if (appState != ST_IDLE) return;
+  if (webHold && !idleClockMode) return;     // 网页笑脸模式: 保持大眼不切换
   if (!idleClockMode) {
     if (now - idlePhaseAt >= IDLE_FACE_MS) idleEnterClock(now);
     return;
@@ -625,7 +634,7 @@ void idleCycleTick(unsigned long now) {
     lastClockMin = curMin;
     if (screenOK) drawClockBig();
   }
-  if (now - idlePhaseAt >= idleClockDur()) {
+  if (!webHold && now - idlePhaseAt >= idleClockDur()) {   // 网页手动时钟: 按住不自动切回
     idlePhaseAt = now;
     idleEnterFace();
   }
@@ -647,7 +656,8 @@ void triggerRemind(uint8_t type, unsigned long now) {
 }
 void backToIdle(unsigned long now) {
   appState = ST_IDLE;
-  rockStop(); oledNormal(); drawEyes(0, 0, 0, false);   // 睁眼回待机
+  webHold = false;                                    // 回到待机 = 释放按住
+  rockStop(); oledNormal(); drawEyes(0, 0, 0, false);   // 睁眼回笑脸睁眼回待机
   eyeMood = 0; eyeDx = 0; eyeDy = 0; eyeBlink = false;  // 同步眼睛帧防重画
   gCorner = false;                                      // 离开提醒时段, 关角标
   idleClockMode = false; idlePhaseAt = now;             // 先看10秒笑脸再进时钟
@@ -671,7 +681,7 @@ void enterPet(unsigned long now) {        // 空闲时被拍: 眯眼笑+轻蠕�
   stateStart = now;
   oledNormal(); drawEyes(1, 0, 0, false);     // ^ ^ 开心眼
   rockPhase = ROCK_FWD; rockStart = now;
-  rockWantDir = DIR_FWD; rockWantPwm = 100;   // 斜坡轻蠕动(撒娇)
+  rockWantDir = DIR_FWD; rockWantPwm = 70;    // 斜坡轻蠕动(撒娇), 低力度防掉压
 }
 
 void appTick(unsigned long now) {
@@ -721,7 +731,7 @@ void appTick(unsigned long now) {
       if (isMed && remindLevel >= 1) {
         if ((now / 50) % 2 == 0) oledInvert(); else oledNormal();
       }
-      if (now - stateStart >= REMIND_MS) {
+      if (now - stateStart >= REMIND_MS && !webHold) {   // webHold=网页手动触发: 保持当前状态直到下一条命令
         Serial.printf("[RemindEnd] lv=%d\n", remindLevel);
         rockStop(); oledNormal();
         if (demoEnabled && remindLevel >= 1) {
@@ -754,7 +764,7 @@ void appTick(unsigned long now) {
         showRemindFace(remindType);
         if (remindType == 2) {
           rockWantDir = DIR_FWD;
-          rockWantPwm = remindLevel >= 3 ? 160 : (remindLevel == 2 ? 140 : 100);
+          rockWantPwm = remindLevel >= 3 ? 120 : (remindLevel == 2 ? 100 : 70);
         }
       }
       break;
@@ -762,7 +772,7 @@ void appTick(unsigned long now) {
 
     case ST_RESPOND: {
       oledNormal();   // 每轮都确认正常显示, 杜绝任何反色残留
-      if (now - stateStart >= 4000) {
+      if (now - stateStart >= 4000 && !webHold) {   // webHold=网页手动触发: 保持显示直到下一条命令
         Serial.println("[Respond] -> idle");
         backToIdle(now);   // 回应显示4秒回笑脸(让表情看清)
       }
@@ -782,6 +792,7 @@ void webTrigger(uint8_t type) {
   unsigned long now = millis();
   manualLockUntil = now + 20000;
   dbgDir = DIR_NONE; wiggleMode = false; activeDir = DIR_NONE; mState = 0;
+  webHold = true;                                  // 网页点的 = 按住当前状态不放
   triggerRemind(type, now);
 }
 void webCancel() {
@@ -791,6 +802,43 @@ void webCancel() {
   rockStop();                      // 晃动软停
   applyMotor(DIR_NONE, 0);         // 立即切断电机PWM, 防止调试行驶后保持出力
   backToIdle(now);
+}
+// 网页: 单独显示笑脸(大眼睛+眨眼+张望), 按住不放直到下一条命令
+void webFaceIdle() {
+  unsigned long now = millis();
+  manualLockUntil = now + 20000;
+  dbgDir = DIR_NONE; wiggleMode = false; activeDir = DIR_NONE; mState = 0;
+  rockStop();
+  applyMotor(DIR_NONE, 0);
+  appState = ST_IDLE;
+  webHold = true;
+  gCorner = false;
+  idleClockMode = false;
+  idlePhaseAt = now;
+  drawEyes(0, 0, 0, false);       // 立即画一帧, 后面 idleFaceTick 会接管眨眼/张望
+  eyeMood = 0; eyeDx = 0; eyeDy = 0; eyeBlink = false;
+}
+// 网页: 笑脸<->大时钟 一键切换, 两边都按住不放
+void webToggleIdle() {
+  unsigned long now = millis();
+  manualLockUntil = now + 20000;
+  dbgDir = DIR_NONE; wiggleMode = false; activeDir = DIR_NONE; mState = 0;
+  rockStop();
+  applyMotor(DIR_NONE, 0);
+  appState = ST_IDLE;
+  webHold = true;
+  gCorner = false;
+  if (idleClockMode) {            // 当前是时钟 -> 切笑脸
+    idleClockMode = false;
+    idlePhaseAt = now;
+    drawEyes(0, 0, 0, false);
+    eyeMood = 0; eyeDx = 0; eyeDy = 0; eyeBlink = false;
+    Serial.println("[Web] 待机切换 -> 笑脸");
+  } else {                        // 当前是笑脸(或其他状态) -> 切大时钟
+    idleEnterClock(now);
+    if (screenOK) drawClockBig(); // 立即显示, 不等下一分钟
+    Serial.println("[Web] 待机切换 -> 大时钟");
+  }
 }
 // 网页: 暂停/开启自动演示
 void webSetAuto(bool on) {
@@ -815,6 +863,7 @@ void webFace(bool thumb) {
   dbgDir = DIR_NONE; wiggleMode = false; activeDir = DIR_NONE; mState = 0;
   encourage = thumb;
   gCorner = true;                        // 回应表情也带左上角时间(贯穿除笑脸外)
+  webHold = true;                                  // 网页点的 = 按住当前状态不放
   enterRespond(now);
 }
 
@@ -868,20 +917,29 @@ void faceAnimTick(unsigned long now) {
 
 // ==================== 串口调试命令 (与商家版一致) ====================
 // T=触发吃药 K=模拟拍击 N=立即校时 C=看大时钟 F/B/L/R/S=行驶 1-6=逐个看表情
+// 串口1-6共用: 停电机+按住当前状态不放
+void serialOverride() {
+  unsigned long now = millis();
+  dbgDir = DIR_NONE; wiggleMode = false; activeDir = DIR_NONE; mState = 0;
+  rockStop();
+  applyMotor(DIR_NONE, 0);
+  webHold = true;
+  manualLockUntil = now + 20000;
+}
 void serialTick() {
   while (Serial.available()) {
     char c = Serial.read();
     unsigned long now = millis();
     switch (c) {
-      case 'T': Serial.println("[串口] 触发吃药提醒"); webTrigger(2); break;
-      case 'K': if (appState == ST_REMIND || appState == ST_FORGOT) enterRespond(now); break;
+      case 'T': Serial.println("[串口] 触发吃药提醒"); webHold = true; webTrigger(2); break;
+      case 'K': webHold = true; if (appState == ST_REMIND || appState == ST_FORGOT) enterRespond(now); break;
       case 'N': syncClockFromNTP(); break;
-      case '1': drawEyes(0, 0, 0, false); break;   // 笑脸(大眼)
-      case '2': drawPill();  break;
-      case '3': drawRun(0);  break;
-      case '4': drawMoon();  break;
-      case '5': drawThumb(); break;
-      case '6': drawHeart(); break;
+      case '1': serialOverride(); gCorner = false; appState = ST_IDLE; idleClockMode = false; idlePhaseAt = now; drawEyes(0,0,0,false); eyeMood=0; eyeDx=0; eyeDy=0; eyeBlink=false; break;
+      case '2': serialOverride(); gCorner = true;  appState = ST_RESPOND; drawPill();  break;
+      case '3': serialOverride(); gCorner = true;  appState = ST_REMIND; remindType = 1; drawRun(0);  break;
+      case '4': serialOverride(); gCorner = false; appState = ST_RESPOND; drawMoon();  break;
+      case '5': serialOverride(); gCorner = true;  appState = ST_RESPOND; drawThumb(); break;
+      case '6': serialOverride(); gCorner = true;  appState = ST_RESPOND; drawHeart(); break;
       case 'C': webCancel(); idleEnterClock(now); break;   // 强制整屏大时钟
       case '[': fwdTrim -= 5; trimSave(); Serial.printf("[纠偏] fwdTrim=%d\n", fwdTrim); break;
       case ']': fwdTrim += 5; trimSave(); Serial.printf("[纠偏] fwdTrim=%d\n", fwdTrim); break;
@@ -925,7 +983,8 @@ button:active{background:rgba(0,255,225,.35)}
 <button onclick="go('/moon','晚安提醒')">😴 晚安</button>
 <button onclick="go('/thumb','点赞')">👍 点赞</button>
 <button onclick="go('/heart','爱心')">❤️ 爱心</button>
-<button onclick="go('/home','返回笑脸')">😊 待机</button>
+<button onclick="go('/face','笑脸')">😊 笑脸</button>
+<button onclick="toggleIdle()">🔀 笑脸/时钟</button>
 </div>
 <h2>运动调试</h2>
 <div class="btns">
@@ -961,6 +1020,18 @@ function go(c,name){
 }
 function spdShow(){
   document.getElementById('spdval').textContent='当前: '+document.getElementById('spd').value;
+}
+function toggleIdle(){
+  var st=document.getElementById('status');
+  st.className=''; st.textContent='切换中...';
+  fetch('/toggleidle',{cache:'no-store'}).then(function(r){
+    if(!r.ok) throw new Error('bad'); return r.text();
+  }).then(function(t){
+    st.className='ok';
+    st.textContent = (t==='CLOCK') ? '✓ 已切换到: 大时钟' : '✓ 已切换到: 笑脸';
+  }).catch(function(){
+    st.className='err'; st.textContent='✗ 没送到, 关掉手机移动数据再试';
+  });
 }
 function saveSpd(){
   var v=document.getElementById('spd').value;
@@ -1011,6 +1082,8 @@ void setupServer() {
   server.on("/thumb",[]() { webFace(true);  server.send(200, "text/plain", "THUMB"); });
   server.on("/heart",[]() { webFace(false); server.send(200, "text/plain", "HEART"); });
   server.on("/home", []() { webCancel();  server.send(200, "text/plain", "HOME"); });
+  server.on("/face", []() { webFaceIdle(); server.send(200, "text/plain", "FACE"); });
+  server.on("/toggleidle", []() { webToggleIdle(); server.send(200, "text/plain", idleClockMode ? "CLOCK" : "FACE"); });
   server.on("/auto0",[]() { webSetAuto(false); server.send(200, "text/plain", "AUTO0"); });
   server.on("/auto1",[]() { webSetAuto(true);  server.send(200, "text/plain", "AUTO1"); });
   server.on("/f", []() { webCancel(); dbgDir = DIR_FWD;   server.send(200, "text/plain", "F"); });
@@ -1085,7 +1158,7 @@ void setup() {
     Wire.beginTransmission(0x3D);
     if (Wire.endTransmission() == 0) { oledAddr = 0x3D; screenOK = true; }
   }
-  if (screenOK) { initOLED(); drawLogo(); }   // 开机字标(联网期间一直显示)
+  if (screenOK) { initOLED(); drawLogo(); delay(2000); }   // 开机字标停留2秒
 
   // WiFi 热点
   Serial.println("WiFi AP starting...");
